@@ -1,3 +1,5 @@
 fastapi
 uvicorn
 pydantic
+unstructured[docx,eml,pdf]
+requests
