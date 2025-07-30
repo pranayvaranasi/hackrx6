@@ -5,6 +5,7 @@ from unstructured.partition.auto import partition
 from nltk.tokenize import sent_tokenize
 import nltk
 from typing import List, Dict, Any
+from app.pinecone_utils import ensure_pinecone_index, upsert_chunks
 
 # Download NLTK data for sentence tokenization
 nltk.download('punkt')
@@ -246,4 +247,7 @@ def parse_document_in_memory(document_url: str) -> List[Dict[str, Any]]:
         if references:
             chunk['metadata']['references'] = references
 
+    index = ensure_pinecone_index()
+    upsert_chunks(final_chunks, index)
+    
     return final_chunks

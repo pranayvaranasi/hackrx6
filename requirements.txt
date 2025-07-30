@@ -4,3 +4,5 @@ pydantic
 unstructured[docx,eml,pdf]
 requests
 nltk
+pinecone  
+sentence-transformers
