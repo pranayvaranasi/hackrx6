@@ -5,4 +5,5 @@ unstructured[docx,eml,pdf]
 requests
 nltk
 pinecone  
-sentence-transformers
+nomic
+python-dotenv
