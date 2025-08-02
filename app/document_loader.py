@@ -11,7 +11,7 @@ from app.pinecone_utils import ensure_pinecone_index, upsert_chunks
 nltk.download('punkt')
 
 def clean_text(text: str, doc_ext: str) -> str:
-    """Clean text based on document extension, removing headers/footers, normalizing whitespace, and fixing broken words."""
+    """Clean text by removing headers/footers, normalizing whitespace, and fixing broken words."""
     # Remove common headers/footers (e.g., company names, page numbers, document IDs)
     text = re.sub(r'(?:Page \d+ of \d+|UIN: [A-Z0-9]+|\b[A-Z][a-zA-Z\s]*Co\.\s*Ltd\.|Confidential\s*?\n)', '', text, flags=re.IGNORECASE)
     # Normalize whitespace
@@ -23,41 +23,46 @@ def clean_text(text: str, doc_ext: str) -> str:
         text = re.sub(r'(?:--+\s*Sent from.*|On .* wrote:.*|Best regards,.*|Sincerely,.*)', '', text, flags=re.IGNORECASE)
     # DOCX-specific cleaning: remove formatting artifacts
     if doc_ext == '.docx':
-        text = re.sub(r'(\[.*?\]|\{.*?\})', '', text)  # Remove placeholder tags
+        text = re.sub(r'(\[.*?\]|\{.*?\})', '', text)
+    # Remove repetitive or boilerplate phrases common in legal/insurance documents
+    text = re.sub(r'(?:This document is.*|All rights reserved|Version \d+\.\d+)', '', text, flags=re.IGNORECASE)
     return text.strip()
 
 def detect_structure(elements: List[Any]) -> List[Dict[str, Any]]:
     """
     Detect logical structure (sections, clauses, lists, tables) in the document.
-    Returns a list of dictionaries with text and metadata.
+    Returns a list of dictionaries with text, heading, and metadata.
     """
     structured_elements = []
     current_section = None
     current_clause = None
     current_page = 1
     last_heading = None
+    context_stack = []  # Track contextual qualifiers (e.g., "NOT covered")
 
     for element in elements:
         text = element.text.strip() if hasattr(element, 'text') else ''
         if not text:
             continue
 
-        # Update page number if available in metadata
+        # Update page number if available
         if hasattr(element, 'metadata') and element.metadata.page_number:
             current_page = element.metadata.page_number
 
-        # Detect headings (e.g., "Section 1", "1.1 Title", or any all-caps/leading numbers)
-        heading_match = re.match(r'^(?:\d+\.\s*[A-Z\s]+|\d+\.\d+\.\s*[A-Z\s]+|[A-Z\s]{10,})', text, re.IGNORECASE)
+        # Detect headings (e.g., "Section 1", "1.1 Title", all-caps, or categorized as Title)
+        heading_match = re.match(r'^(?:\d+\.\s*[A-Z\s]+|\d+\.\d+\.\s*[A-Z\s]+|[A-Z\s]{10,}|[0-9]+\.\s*[A-Za-z].+)', text, re.IGNORECASE)
         if heading_match or (hasattr(element, 'category') and element.category == 'Title'):
             current_section = text
             last_heading = text
+            context_stack = []  # Reset context for new section
             structured_elements.append({
                 'text': text,
+                'heading': last_heading,
                 'metadata': {
                     'section': current_section,
                     'clause': None,
                     'page': current_page,
-                    'heading': last_heading
+                    'context': []
                 }
             })
             continue
@@ -68,79 +73,117 @@ def detect_structure(elements: List[Any]) -> List[Dict[str, Any]]:
             current_clause = clause_match.group(0)
             structured_elements.append({
                 'text': text,
+                'heading': last_heading,
                 'metadata': {
                     'section': current_section,
                     'clause': current_clause,
                     'page': current_page,
-                    'heading': last_heading
+                    'context': context_stack
                 }
             })
             continue
 
-        # Handle lists and tables
+        # Detect contextual qualifiers (e.g., "NOT covered", "Exclusions", "Conditions apply")
+        context_match = re.search(r'(?:not covered|exclusions?|conditions\s*apply|subject to|except\s*for|unless\s*otherwise\s*stated)', text, re.IGNORECASE)
+        if context_match:
+            context_stack.append(context_match.group(0))
+
+        # Handle lists, tables, or annexures
         if hasattr(element, 'category') and element.category == 'ListItem':
             structured_elements.append({
                 'text': text,
+                'heading': last_heading,
                 'metadata': {
                     'section': current_section,
                     'clause': current_clause,
                     'page': current_page,
-                    'heading': last_heading
+                    'context': context_stack
                 }
             })
         elif hasattr(element, 'category') and element.category == 'Table':
             structured_elements.append({
                 'text': text,
+                'heading': last_heading,
                 'metadata': {
                     'section': current_section,
                     'clause': current_clause,
                     'page': current_page,
-                    'heading': last_heading
+                    'context': context_stack
+                }
+            })
+        elif 'annexure' in text.lower() or 'schedule' in text.lower():
+            structured_elements.append({
+                'text': text,
+                'heading': last_heading or text,
+                'metadata': {
+                    'section': current_section or text,
+                    'clause': None,
+                    'page': current_page,
+                    'context': context_stack
                 }
             })
         else:
             # Regular text
             structured_elements.append({
                 'text': text,
+                'heading': last_heading,
                 'metadata': {
                     'section': current_section,
                     'clause': current_clause,
                     'page': current_page,
-                    'heading': last_heading
+                    'context': context_stack
                 }
             })
 
     return structured_elements
 
-def sliding_window_chunking(text: str, window_size: int = 500, overlap: int = 100) -> List[str]:
+def semantic_chunking(text: str, heading: str, metadata: Dict[str, Any], max_tokens: int = 500, overlap: int = 100) -> List[Dict[str, Any]]:
     """
-    Apply sliding window chunking to long text with overlap.
+    Split text into semantic chunks, ensuring each chunk includes the section heading and preserves context.
     """
     sentences = sent_tokenize(text)
     chunks = []
-    current_chunk = []
-    current_length = 0
+    current_chunk = [heading]  # Start with heading
+    current_length = len(heading.split())
+    current_context = metadata.get('context', [])
 
     for sentence in sentences:
         sentence_tokens = len(sentence.split())
-        if current_length + sentence_tokens > window_size and current_chunk:
-            chunks.append(' '.join(current_chunk))
+        if current_length + sentence_tokens > max_tokens and current_chunk:
+            # Finalize current chunk
+            chunk_text = ' '.join(current_chunk)
+            if current_context:
+                chunk_text = f"[{', '.join(current_context)}] {chunk_text}"
+            chunks.append({
+                'chunk_text': chunk_text,
+                'heading': heading,
+                'metadata': metadata
+            })
+            # Start new chunk with heading and overlap
             overlap_sentences = []
             overlap_length = 0
-            for sent in current_chunk[::-1]:
+            for sent in current_chunk[::-1][:-1]:  # Exclude heading for overlap
                 sent_tokens = len(sent.split())
                 if overlap_length + sent_tokens <= overlap:
                     overlap_sentences.append(sent)
                     overlap_length += sent_tokens
                 else:
                     break
-            current_chunk = overlap_sentences[::-1]
-            current_length = overlap_length
+            current_chunk = [heading] + overlap_sentences[::-1]
+            current_length = len(heading.split()) + overlap_length
         current_chunk.append(sentence)
         current_length += sentence_tokens
 
+    # Add remaining chunk
     if current_chunk:
-        chunks.append(' '.join(current_chunk))
+        chunk_text = ' '.join(current_chunk)
+        if current_context:
+            chunk_text = f"[{', '.join(current_context)}] {chunk_text}"
+        chunks.append({
+            'chunk_text': chunk_text,
+            'heading': heading,
+            'metadata': metadata
+        })
 
     return chunks
 
@@ -158,88 +201,45 @@ def parse_document_in_memory(document_url: str) -> List[Dict[str, Any]]:
         file_like = BytesIO(requests.get(document_url).content)
     except requests.RequestException as e:
         raise ValueError(f"Failed to download document: {str(e)}")
-    
+
     # Parse document using unstructured
     elements = partition(file=file_like, file_filename=f'document{ext}', include_page_breaks=True)
-    
+
     # Clean text
     raw_text = ' '.join([el.text.strip() for el in elements if hasattr(el, 'text') and el.text.strip()])
     cleaned_text = clean_text(raw_text, ext)
-    
+
     # Detect structure
     structured_elements = detect_structure(elements)
-    
-    # Process chunks
+
+    # Process chunks by section
     final_chunks = []
-    current_chunk_text = []
+    current_section_text = []
+    current_heading = None
     current_metadata = None
-    current_token_count = 0
-    window_size = 500
+    max_tokens = 500
     overlap = 100
 
     for element in structured_elements:
         text = element['text']
+        heading = element['heading']
         metadata = element['metadata']
-        token_count = len(text.split())
 
-        # Handle tables
-        if hasattr(element, 'category') and element.category == 'Table':
-            final_chunks.append({
-                'chunk_text': text,
-                'metadata': metadata
-            })
-            continue
+        if heading != current_heading:
+            # Process previous section
+            if current_section_text:
+                section_text = ' '.join(current_section_text)
+                final_chunks.extend(semantic_chunking(section_text, current_heading, current_metadata, max_tokens, overlap))
+                current_section_text = []
+            current_heading = heading
+            current_metadata = metadata
 
-        # Handle lists (group logically)
-        if hasattr(element, 'category') and element.category == 'ListItem':
-            current_chunk_text.append(text)
-            current_token_count += token_count
-            if current_token_count >= window_size:
-                final_chunks.append({
-                    'chunk_text': ' '.join(current_chunk_text),
-                    'metadata': metadata
-                })
-                current_chunk_text = current_chunk_text[-2:]  # Overlap with last 2 items
-                current_token_count = sum(len(t.split()) for t in current_chunk_text)
-            continue
+        current_section_text.append(text)
 
-        # Handle annexures or schedules
-        if 'annexure' in text.lower() or 'schedule' in text.lower():
-            if current_chunk_text:
-                final_chunks.append({
-                    'chunk_text': ' '.join(current_chunk_text),
-                    'metadata': current_metadata
-                })
-                current_chunk_text = []
-                current_token_count = 0
-            final_chunks.append({
-                'chunk_text': text,
-                'metadata': metadata
-            })
-            continue
-
-        # Regular text chunking
-        current_chunk_text.append(text)
-        current_token_count += token_count
-        current_metadata = metadata
-
-        if current_token_count >= window_size:
-            chunk_text = ' '.join(current_chunk_text)
-            sub_chunks = sliding_window_chunking(chunk_text, window_size, overlap)
-            for sub_chunk in sub_chunks:
-                final_chunks.append({
-                    'chunk_text': sub_chunk,
-                    'metadata': metadata
-                })
-            current_chunk_text = current_chunk_text[-2:]  # Overlap with last 2 sentences
-            current_token_count = sum(len(t.split()) for t in current_chunk_text)
-
-    # Add remaining text
-    if current_chunk_text:
-        final_chunks.append({
-            'chunk_text': ' '.join(current_chunk_text),
-            'metadata': current_metadata
-        })
+    # Process final section
+    if current_section_text:
+        section_text = ' '.join(current_section_text)
+        final_chunks.extend(semantic_chunking(section_text, current_heading, current_metadata, max_tokens, overlap))
 
     # Parse clause relationships (e.g., "See Section 4.2", "Refer to Clause A-1")
     for chunk in final_chunks:
@@ -249,5 +249,5 @@ def parse_document_in_memory(document_url: str) -> List[Dict[str, Any]]:
 
     index = ensure_pinecone_index()
     upsert_chunks(final_chunks, index)
-    
+
     return final_chunks
