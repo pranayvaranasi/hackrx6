@@ -2,7 +2,7 @@ import re
 from io import BytesIO
 import requests
 from unstructured.partition.auto import partition
-from nltk.tokenize import sent_tokenize
+from nltk.tokenize import sent_tokenize, WordPunctTokenizer
 import nltk
 from typing import List, Dict, Any
 from app.pinecone_utils import ensure_pinecone_index, upsert_chunks
@@ -139,50 +139,92 @@ def detect_structure(elements: List[Any]) -> List[Dict[str, Any]]:
 
 def semantic_chunking(text: str, heading: str, metadata: Dict[str, Any], max_tokens: int = 500, overlap: int = 100) -> List[Dict[str, Any]]:
     """
-    Split text into semantic chunks, ensuring each chunk includes the section heading and preserves context.
+    Split text into semantic chunks, respecting clause boundaries and including heading/context.
     """
     sentences = sent_tokenize(text)
     chunks = []
-    current_chunk = [heading]  # Start with heading
-    current_length = len(heading.split())
+    current_chunk = [heading] if heading else []
+    tokenizer = WordPunctTokenizer()
+    current_length = len(tokenizer.tokenize(heading)) if heading else 0
     current_context = metadata.get('context', [])
+    current_clause = metadata.get('clause', None)
+
+    # Fallback context detection if metadata['context'] is empty
+    if not current_context:
+        for sentence in sentences:
+            context_match = re.search(r'(?:not covered|exclusions?|conditions\s*apply|subject to|except\s*for|unless\s*otherwise\s*stated)', sentence, re.IGNORECASE)
+            if context_match and context_match.group(0) not in current_context:
+                current_context.append(context_match.group(0))
+
+    clause_buffer = []
+    clause_length = 0
 
     for sentence in sentences:
-        sentence_tokens = len(sentence.split())
-        if current_length + sentence_tokens > max_tokens and current_chunk:
-            # Finalize current chunk
+        sentence_tokens = len(tokenizer.tokenize(sentence))
+        is_clause_start = re.match(r'^(?:[a-z]\)|\d+\.|Code\s*-\s*[A-Za-z0-9]+|[ivx]+\.)', sentence, re.IGNORECASE)
+
+        if is_clause_start and clause_buffer:
+            # Finalize previous clause
+            if current_length + clause_length <= max_tokens:
+                current_chunk.extend(clause_buffer)
+                current_length += clause_length
+            else:
+                # Prepend context to chunk_text if present
+                chunk_text = ' '.join(current_chunk)
+                if current_context:
+                    chunk_text = f"[{' '.join(current_context)}] {chunk_text}"
+                chunks.append({
+                    'chunk_text': chunk_text,
+                    'heading': heading,
+                    'metadata': {**metadata, 'clause': current_clause or '', 'context': current_context}
+                })
+                # Include overlap sentences
+                overlap_sentences = clause_buffer[-min(len(clause_buffer), 1 if clause_length < 100 else 2):]
+                overlap_length = sum(len(tokenizer.tokenize(s)) for s in overlap_sentences)
+                current_chunk = [heading] + overlap_sentences if heading else overlap_sentences
+                current_length = len(tokenizer.tokenize(heading)) + overlap_length if heading else overlap_length
+            clause_buffer = []
+            clause_length = 0
+            current_clause = is_clause_start.group(0)
+
+        clause_buffer.append(sentence)
+        clause_length += sentence_tokens
+
+    # Process remaining clause
+    if clause_buffer:
+        if current_length + clause_length <= max_tokens:
+            current_chunk.extend(clause_buffer)
+        else:
             chunk_text = ' '.join(current_chunk)
             if current_context:
-                chunk_text = f"[{', '.join(current_context)}] {chunk_text}"
+                chunk_text = f"[{' '.join(current_context)}] {chunk_text}"
             chunks.append({
                 'chunk_text': chunk_text,
                 'heading': heading,
-                'metadata': metadata
+                'metadata': {**metadata, 'clause': current_clause or '', 'context': current_context}
             })
-            # Start new chunk with heading and overlap
-            overlap_sentences = []
-            overlap_length = 0
-            for sent in current_chunk[::-1][:-1]:  # Exclude heading for overlap
-                sent_tokens = len(sent.split())
-                if overlap_length + sent_tokens <= overlap:
-                    overlap_sentences.append(sent)
-                    overlap_length += sent_tokens
-                else:
-                    break
-            current_chunk = [heading] + overlap_sentences[::-1]
-            current_length = len(heading.split()) + overlap_length
-        current_chunk.append(sentence)
-        current_length += sentence_tokens
+            overlap_sentences = clause_buffer[-min(len(clause_buffer), 1 if clause_length < 100 else 2):]
+            overlap_length = sum(len(tokenizer.tokenize(s)) for s in overlap_sentences)
+            current_chunk = [heading] + overlap_sentences if heading else overlap_sentences
+            current_length = len(tokenizer.tokenize(heading)) + overlap_length if heading else overlap_length
+            chunk_text = ' '.join(current_chunk)
+            if current_context:
+                chunk_text = f"[{' '.join(current_context)}] {chunk_text}"
+            chunks.append({
+                'chunk_text': chunk_text,
+                'heading': heading,
+                'metadata': {**metadata, 'clause': current_clause or '', 'context': current_context}
+            })
 
-    # Add remaining chunk
-    if current_chunk:
+    # Add final chunk if any
+    if current_chunk and (len(current_chunk) > 1 or (current_chunk and current_chunk[0] != heading)):
         chunk_text = ' '.join(current_chunk)
         if current_context:
-            chunk_text = f"[{', '.join(current_context)}] {chunk_text}"
+            chunk_text = f"[{' '.join(current_context)}] {chunk_text}"
         chunks.append({
             'chunk_text': chunk_text,
             'heading': heading,
-            'metadata': metadata
+            'metadata': {**metadata, 'clause': current_clause or '', 'context': current_context}
         })
 
     return chunks
