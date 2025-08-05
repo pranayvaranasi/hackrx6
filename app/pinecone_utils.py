@@ -43,21 +43,26 @@ def generate_embeddings(texts: List[str], task_type: str = 'search_document') ->
     )
     return response['embeddings']
 
-def upsert_chunks(chunks: List[Dict[str, Any]], index):
-    """Upsert document chunks with embeddings to Pinecone."""
+def upsert_chunks(chunks: List[Dict[str, Any]], index, batch_size: int = 50):
+    """Upsert document chunks with embeddings to Pinecone in batches."""
     texts = [chunk['chunk_text'] for chunk in chunks]
     embeddings = generate_embeddings(texts, task_type='search_document')
+
     vectors = []
     for i, (embedding, chunk) in enumerate(zip(embeddings, chunks)):
         sanitized_metadata = {}
+        sanitized_metadata['chunk_text'] = chunk['chunk_text'] 
+
         for key, value in chunk['metadata'].items():
             if value is None:
                 sanitized_metadata[key] = ""
             elif isinstance(value, (str, int, float, bool, list)):
-                if isinstance(value, list):
+                if isinstance(value, str):
+                    sanitized_metadata[key] = value
+                elif isinstance(value, list):
                     sanitized_metadata[key] = value if all(isinstance(v, str) for v in value) else str(value)
                 else:
-                    sanitized_metadata[key] = value
+                    sanitized_metadata[key] = str(value)
             else:
                 sanitized_metadata[key] = str(value)
         vectors.append({
@@ -65,7 +70,12 @@ def upsert_chunks(chunks: List[Dict[str, Any]], index):
             "values": embedding,
             "metadata": sanitized_metadata
         })
-    index.upsert(vectors=vectors)
+
+    # Batch upload
+    for i in range(0, len(vectors), batch_size):
+        batch = vectors[i:i+batch_size]
+        index.upsert(vectors=batch)
+
 
 def query_pinecone(query: str, index, top_k: int = 5) -> List[Dict[str, Any]]:
     """Query Pinecone for top-k relevant chunks."""
@@ -76,10 +86,10 @@ def query_pinecone(query: str, index, top_k: int = 5) -> List[Dict[str, Any]]:
         include_metadata=True
     )
     return [
-        {
-            "chunk_text": match['metadata'].get('text', ''),
-            "metadata": match['metadata'],
-            "score": match['score']
-        }
-        for match in results['matches']
-    ]
+    {
+        "chunk_text": match['metadata'].get('chunk_text', ''), 
+        "metadata": match['metadata'],
+        "score": match['score']
+    }
+    for match in results['matches']
+]

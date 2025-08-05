@@ -17,11 +17,13 @@ You are a smart assistant that parses enterprise queries across insurance, legal
 
 For each query, return a JSON with:
 - intent: such as  "coverage_check", "eligibility_check", "benefit_details", "policy_definition", "clause_lookup", "termination_policy" and etc
-- entity: the main subject or topic (e.g., "maternity leave", "section 4.2", "hospital definition" and etc)
-- conditions: list of qualifiers or context needed to answer accurately
+- entity: the main subject or topic (e.g., "maternity expenses", "hospital definition")
+- conditions: list of qualifiers or context (e.g., "2 years continuous coverage")
+- keywords: list of important terms/phrases the user is looking for in relevant clauses (e.g., "grace period", "30 days", "renewal", "covered expenses")
 
 Respond ONLY with valid JSON.
 """
+
 
 def parse_query_with_mistral(question: str) -> dict:
     response = client.chat.completions.create(

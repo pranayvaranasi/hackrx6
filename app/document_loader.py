@@ -217,15 +217,27 @@ def semantic_chunking(text: str, heading: str, metadata: Dict[str, Any], max_tok
             })
 
     # Add final chunk if any
-    if current_chunk and (len(current_chunk) > 1 or (current_chunk and current_chunk[0] != heading)):
+    if current_chunk:
         chunk_text = ' '.join(current_chunk)
         if current_context:
             chunk_text = f"[{' '.join(current_context)}] {chunk_text}"
         chunks.append({
-            'chunk_text': chunk_text,
-            'heading': heading,
-            'metadata': {**metadata, 'clause': current_clause or '', 'context': current_context}
-        })
+        'chunk_text': chunk_text,
+        'heading': heading,
+        'metadata': {**metadata, 'clause': current_clause or '', 'context': current_context}
+    })
+
+    # Also handle remaining clause_buffer if not empty (ensure nothing is skipped)
+    if clause_buffer:
+        chunk_text = ' '.join(clause_buffer)
+        if current_context:
+            chunk_text = f"[{' '.join(current_context)}] {chunk_text}"
+        chunks.append({
+        'chunk_text': chunk_text,
+        'heading': heading,
+        'metadata': {**metadata, 'clause': current_clause or '', 'context': current_context}
+    })
+
 
     return chunks
 
